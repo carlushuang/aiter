@@ -2488,35 +2488,36 @@ def compile_mxscale_gemm(
                 )
                 active0_adv_i32 = adv_b_i32
 
+                # active1: wave0->A0, wave1->Bs0, wave2->A1, wave3->Bs1
                 active1_stage_lds_addr = [
                     _select_wave4(
                         _aslc_lds[0][i],
-                        _aslc_lds[1][i],
                         _bsslc_lds[0][i],
+                        _aslc_lds[1][i],
                         _bsslc_lds[1][i],
                     )
                     for i in range_constexpr(num_buffers)
                 ]
                 active1_addr_lo = _select_wave4(
                     _lo(_aslc_init[0]),
-                    _lo(_aslc_init[1]),
                     _lo(_bsslc_init[0]),
+                    _lo(_aslc_init[1]),
                     _lo(_bsslc_init[1]),
                 )
                 active1_addr_hi = _select_wave4(
                     _hi(_aslc_init[0]),
-                    _hi(_aslc_init[1]),
                     _hi(_bsslc_init[0]),
+                    _hi(_aslc_init[1]),
                     _hi(_bsslc_init[1]),
                 )
                 active1_dgroup1 = _select_wave4(
                     _aslc_init[0].dgroup1,
-                    _aslc_init[1].dgroup1,
                     _bsslc_init[0].dgroup1,
+                    _aslc_init[1].dgroup1,
                     _bsslc_init[1].dgroup1,
                 )
                 active1_adv_i32 = _select_wave4(
-                    adv_a_i32, adv_a_i32, adv_bs_i32, adv_bs_i32
+                    adv_a_i32, adv_bs_i32, adv_a_i32, adv_bs_i32
                 )
             elif const_expr(wave_specialized_tdm):
                 active_stage_lds_addr = [
