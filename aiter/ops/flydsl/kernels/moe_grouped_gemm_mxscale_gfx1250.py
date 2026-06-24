@@ -755,12 +755,15 @@ def _compile_base_a8w4_gemm(
         out_dtype=cfg.out_dtype,
         use_tdm_store=cfg.use_tdm_store and cfg.split_k == 1 and is_non_fused,
         inst_prefetch=cfg.inst_prefetch,
-        # Wave-specialized TDM (4 streams A,B,As,Bs -> 4 loader waves) is valid for
-        # any single-B GEMM: the non-fused path (is_non_fused) and the gugu
-        # (interleaved single-B) fused gemm1. The gguu fused gemm1 is dual-B
-        # (6 streams) and is excluded.
+        # Wave-specialized TDM is valid for single-B GEMMs (non-fused, gugu
+        # interleaved single-B), and for the dual-B gguu fused gemm1 when As is
+        # hoisted to the prologue (wst_dual2: 2 TDM/wave across 4 waves).
         wave_specialized_tdm=cfg.wave_specialized_tdm
-        and (is_non_fused or stage1_weight_layout == "gugu"),
+        and (
+            is_non_fused
+            or stage1_weight_layout == "gugu"
+            or (stage1_weight_layout == "gguu" and cfg.tdm_as_in_prologue)
+        ),
         tdm_as_in_prologue=cfg.tdm_as_in_prologue,
         split_k=cfg.split_k,
         cluster_m=cfg.cluster_m,

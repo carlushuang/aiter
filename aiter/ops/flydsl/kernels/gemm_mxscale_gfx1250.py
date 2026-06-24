@@ -214,14 +214,15 @@ def compile_mxscale_gemm(
                 "stage1_act GEMM epilogue fuse requires use_tdm_store=False"
             )
         if wave_specialized_tdm and stage1_weight_layout_mode != "gugu":
-            # gguu is dual-B: gate+up are separate weights -> 6 TDM streams
-            # (A, B_gate, B_up, As, Bs_gate, Bs_up), which cannot map onto the
-            # 4-wave / 4-way wave-specialized load model. The gugu (interleaved)
-            # layout is single-B (4 streams: A, B, As, Bs) and IS supported.
-            raise ValueError(
-                "stage1_act fused epilogue supports wave_specialized_tdm only for "
-                "the gugu (interleaved single-B) layout, not gguu (dual-B)"
-            )
+            # gugu (single-B) WST is the original path. gguu (dual-B) WST is also
+            # supported, but ONLY with As hoisted to the prologue (wst_dual2): the
+            # 5 streamed tensors (A, B_gate, B_up, Bs_gate, Bs_up) map to 2-per-wave
+            # across 4 waves, As resident.
+            if not (stage1_weight_layout_mode == "gguu" and tdm_as_in_prologue):
+                raise ValueError(
+                    "stage1_act fused epilogue supports wave_specialized_tdm for "
+                    "gugu, or for gguu only with tdm_as_in_prologue (As resident)"
+                )
         if stage1_weight_layout_mode == "gugu" and N % 2 != 0:
             raise ValueError("stage1 gugu fused epilogue requires raw N == 2*inter_dim")
     if grouped_persistent_m and (cluster_m > 1 or cluster_n > 1):
@@ -293,14 +294,17 @@ def compile_mxscale_gemm(
         stage1_act_mode is not None and stage1_weight_layout_mode == "gugu"
     )
     stage1_dual_b = stage1_act_mode is not None and not stage1_act_interleave
-    if wave_specialized_tdm and stage1_dual_b:
-        # The WST B-split (wave0+wave1=B, wave2=A, wave3=Bs) has no spare wave
-        # for the second (gate) B/Bs stream that dual-B requires.
-        raise ValueError("wave_specialized_tdm is incompatible with stage1_dual_b")
-    if tdm_as_in_prologue and stage1_dual_b:
-        # Untested combination; the prologue As path is validated for single-B
-        # only (wst gugu / non-fused). Guard it off until dual-B is exercised.
-        raise ValueError("tdm_as_in_prologue is not supported with stage1_dual_b")
+    # wst_dual2: wave-specialized TDM for dual-B (gguu), 2 TDM/wave (8 total):
+    #   wave0: B_gate0,A0  wave1: B_up0,Bs_gate  wave2: B_gate1,A1  wave3: B_up1,Bs_up
+    # B_gate/B_up split into 2 N-slices each, A split into 2 M-slices, Bs_gate /
+    # Bs_up loaded whole (one each). As is resident in the prologue.
+    wst_dual2 = wave_specialized_tdm and stage1_dual_b
+    if wst_dual2 and not tdm_as_in_prologue:
+        raise ValueError("wst dual-B requires tdm_as_in_prologue (As resident)")
+    if tdm_as_in_prologue and stage1_dual_b and not wst_dual2:
+        raise ValueError(
+            "tdm_as_in_prologue with dual-B is only supported via wst_dual2"
+        )
     B_TOTAL_N = N if stage1_act_interleave else (N * 2 if stage1_dual_b else N)
     C_N = N // 2 if stage1_act_interleave else N
 
@@ -437,6 +441,20 @@ def compile_mxscale_gemm(
         bsslice_sr = [_bs_sr, _bs_sr]
         bsslice_start_sr = [0, _bs_sr]
 
+    if wst_dual2:
+        if (tile_n // 16) % 2 != 0 or tile_m % 2 != 0:
+            raise ValueError("wst_dual2 needs tile_n//16 even and tile_m%2==0")
+        # B_gate / B_up: 2 even N-slices each (16-col units).
+        _bd_u = (tile_n // 16) // 2
+        d2_b_units = [_bd_u, _bd_u]
+        d2_b_start_u = [0, _bd_u]
+        # A: 2 even M-slices.
+        _ad_m = tile_m // 2
+        d2_a_m = [_ad_m, _ad_m]
+        d2_a_start_m = [0, _ad_m]
+        # Bs_gate / Bs_up loaded whole (full N super-rows).
+        d2_bs_sr_full = tile_n // BS_N32K4_BLOCK_N
+
     # All pipeline stages share the same intra-stage layout. Keep that layout
     # unchanged and only remap each logical stage to a physical base inside one
     # LDS arena so TDM epilogue can alias the dead prefix of the arena.
@@ -555,7 +573,7 @@ def compile_mxscale_gemm(
     # freed As wave now carries the second B half).
     TDM_LOADS_PER_STEP = (
         2
-        if wst_tdm2
+        if (wst_tdm2 or wst_dual2)
         else 1
         if wave_specialized_tdm
         else ((6 if stage1_dual_b else 4) - (1 if tdm_as_in_prologue else 0))
@@ -827,16 +845,18 @@ def compile_mxscale_gemm(
                     atomic_barrier_enable=atomic_barrier_enable,
                 )
 
-            def make_desc_b_slice(memref, k_base, n_start_u, n_width_u):
-                # One N-slice of B (n_start_u/n_width_u in 16-col units), single
-                # wave, into LDS sub-offset n_start_u*16*packed_tile_k_b.
+            def make_desc_b_slice(memref, k_base, n_start_u, n_width_u, n_base=0):
+                # One N-slice of B (n_start_u/n_width_u in 16-col units, n_base in
+                # raw N cols for gate=0/up=N), single wave, LDS sub-offset baked in.
                 k_packed_off = k_base / arith.index(PACK_FACTOR_B)
                 slice_lds_off = n_start_u * 16 * packed_tile_k_b
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_b,
                     lds_memref=memref,
                     global_offset=(
-                        batch_b_base + blk_n / arith.index(16) + arith.index(n_start_u),
+                        batch_b_base
+                        + (blk_n + arith.index(n_base + n_start_u * 16))
+                        / arith.index(16),
                         k_packed_off * arith.index(16),
                     ),
                     tensor_shape=(batch_count * (B_TOTAL_N // 16), K_packed_b * 16),
@@ -943,13 +963,13 @@ def compile_mxscale_gemm(
                     atomic_barrier_enable=atomic_barrier_enable,
                 )
 
-            def make_desc_bs_slice(memref, k_base, n_start_sr, n_width_sr):
+            def make_desc_bs_slice(memref, k_base, n_start_sr, n_width_sr, n_base=0):
                 # One N-slice of B-scale, n_start_sr/n_width_sr in 32-row super-row
-                # units, single wave, LDS sub-offset n_start_sr*scale_k_per_tile*32.
+                # units (n_base in raw N cols for gate=0/up=N), single wave.
                 k_scale_off = k_base / arith.index(SCALE_BLOCK)
-                outer_off = blk_n / arith.index(BS_N32K4_BLOCK_N) + arith.index(
-                    n_start_sr
-                )
+                outer_off = (
+                    blk_n + arith.index(n_base + n_start_sr * BS_N32K4_BLOCK_N)
+                ) / arith.index(BS_N32K4_BLOCK_N)
                 inner_off = k_scale_off * arith.index(BS_N32K4_BLOCK_N)
                 slice_lds_off = n_start_sr * scale_k_per_tile * BS_N32K4_BLOCK_N
                 return tdm_ops.make_tensor_descriptor_2d(
@@ -1003,7 +1023,7 @@ def compile_mxscale_gemm(
                         # wave0, wave1 -> B (per-wave half already baked in).
                         return arith.select(tdm_wave_is_b, b_value, result)
 
-                    if const_expr(wst_tdm2):
+                    if const_expr(wst_tdm2 or wst_dual2):
                         _w_is0 = arith.cmpi(
                             arith.CmpIPredicate.eq,
                             tdm_wave_id,
@@ -2519,6 +2539,114 @@ def compile_mxscale_gemm(
                 active1_adv_i32 = _select_wave4(
                     adv_a_i32, adv_bs_i32, adv_a_i32, adv_bs_i32
                 )
+            elif const_expr(wst_dual2):
+                # dual-B, 2 TDM/wave:
+                #   active0: wave0->Bgate0 wave1->Bup0 wave2->Bgate1 wave3->Bup1
+                #   active1: wave0->A0 wave1->Bsgate wave2->A1 wave3->Bsup
+                def _lds(d):
+                    return vector.extract(
+                        d.dgroup0, static_position=[1], dynamic_position=[]
+                    )
+
+                def _lo(d):
+                    return vector.extract(
+                        d.dgroup0, static_position=[2], dynamic_position=[]
+                    )
+
+                def _hi(d):
+                    return vector.extract(
+                        d.dgroup0, static_position=[3], dynamic_position=[]
+                    )
+
+                # Per-stage LDS addrs.
+                _Bg_lds = [
+                    [
+                        _lds(make_desc_b_slice(stages_b_mem[i], arith.index(0),
+                                               d2_b_start_u[s], d2_b_units[s], 0))
+                        for i in range_constexpr(num_buffers)
+                    ]
+                    for s in range_constexpr(2)
+                ]
+                _Bu_lds = [
+                    [
+                        _lds(make_desc_b_slice(stages_b_up_mem[i], arith.index(0),
+                                               d2_b_start_u[s], d2_b_units[s], N))
+                        for i in range_constexpr(num_buffers)
+                    ]
+                    for s in range_constexpr(2)
+                ]
+                _A_lds = [
+                    [
+                        _lds(make_desc_a_slice(stages_a_mem[i], arith.index(0),
+                                               d2_a_start_m[s], d2_a_m[s]))
+                        for i in range_constexpr(num_buffers)
+                    ]
+                    for s in range_constexpr(2)
+                ]
+                _Bsg_lds = [
+                    _lds(make_desc_bs_slice(stages_bs_mem[i], arith.index(0),
+                                            0, d2_bs_sr_full, 0))
+                    for i in range_constexpr(num_buffers)
+                ]
+                _Bsu_lds = [
+                    _lds(make_desc_bs_slice(stages_bs_up_mem[i], arith.index(0),
+                                            0, d2_bs_sr_full, N))
+                    for i in range_constexpr(num_buffers)
+                ]
+                _Bg = [
+                    make_desc_b_slice(stages_b_mem[0], split_k_base,
+                                      d2_b_start_u[s], d2_b_units[s], 0)
+                    for s in range_constexpr(2)
+                ]
+                _Bu = [
+                    make_desc_b_slice(stages_b_up_mem[0], split_k_base,
+                                      d2_b_start_u[s], d2_b_units[s], N)
+                    for s in range_constexpr(2)
+                ]
+                _Aslc = [
+                    make_desc_a_slice(stages_a_mem[0], split_k_base,
+                                      d2_a_start_m[s], d2_a_m[s])
+                    for s in range_constexpr(2)
+                ]
+                _Bsg = make_desc_bs_slice(
+                    stages_bs_mem[0], split_k_base, 0, d2_bs_sr_full, 0
+                )
+                _Bsu = make_desc_bs_slice(
+                    stages_bs_up_mem[0], split_k_base, 0, d2_bs_sr_full, N
+                )
+
+                active0_stage_lds_addr = [
+                    _select_wave4(_Bg_lds[0][i], _Bu_lds[0][i], _Bg_lds[1][i],
+                                  _Bu_lds[1][i])
+                    for i in range_constexpr(num_buffers)
+                ]
+                active0_addr_lo = _select_wave4(
+                    _lo(_Bg[0]), _lo(_Bu[0]), _lo(_Bg[1]), _lo(_Bu[1])
+                )
+                active0_addr_hi = _select_wave4(
+                    _hi(_Bg[0]), _hi(_Bu[0]), _hi(_Bg[1]), _hi(_Bu[1])
+                )
+                active0_dgroup1 = _select_wave4(
+                    _Bg[0].dgroup1, _Bu[0].dgroup1, _Bg[1].dgroup1, _Bu[1].dgroup1
+                )
+                active0_adv_i32 = adv_b_i32
+
+                active1_stage_lds_addr = [
+                    _select_wave4(_A_lds[0][i], _Bsg_lds[i], _A_lds[1][i], _Bsu_lds[i])
+                    for i in range_constexpr(num_buffers)
+                ]
+                active1_addr_lo = _select_wave4(
+                    _lo(_Aslc[0]), _lo(_Bsg), _lo(_Aslc[1]), _lo(_Bsu)
+                )
+                active1_addr_hi = _select_wave4(
+                    _hi(_Aslc[0]), _hi(_Bsg), _hi(_Aslc[1]), _hi(_Bsu)
+                )
+                active1_dgroup1 = _select_wave4(
+                    _Aslc[0].dgroup1, _Bsg.dgroup1, _Aslc[1].dgroup1, _Bsu.dgroup1
+                )
+                active1_adv_i32 = _select_wave4(
+                    adv_a_i32, adv_bs_i32, adv_a_i32, adv_bs_i32
+                )
             elif const_expr(wave_specialized_tdm):
                 active_stage_lds_addr = [
                     _select_wave_tdm_value(
@@ -2635,7 +2763,7 @@ def compile_mxscale_gemm(
                 pipeline_fence(outstanding=0, use_cluster=use_cluster)
 
             # Prologue
-            if const_expr(wst_tdm2):
+            if const_expr(wst_tdm2 or wst_dual2):
                 for i in range_constexpr(pre_loaded):
                     _dg0_0 = vector.from_elements(
                         T.vec(4, T.i32),
@@ -2758,7 +2886,93 @@ def compile_mxscale_gemm(
             _fence_outstanding = TDM_LOADS_PER_STEP * (num_buffers - 2)
 
             if const_expr(loop_iters > 0):
-                if const_expr(wst_tdm2):
+                if const_expr(wst_dual2):
+                    init_args = (
+                        list(accs)
+                        + list(accs_up)
+                        + [active0_addr_lo, active1_addr_lo]
+                    )
+
+                    for loop_iter, state in range(0, loop_iters, 1, init=init_args):
+                        accs_in = list(state[:n_accs])
+                        accs_up_in = list(state[n_accs : 2 * n_accs])
+                        cur_lo0 = state[2 * n_accs]
+                        cur_lo1 = state[2 * n_accs + 1]
+
+                        for buf_idx in range_constexpr(num_buffers):
+                            load_stage = (buf_idx + num_buffers - 1) % num_buffers
+
+                            pipeline_fence_signal(
+                                outstanding=_fence_outstanding, use_cluster=use_cluster
+                            )
+                            pipeline_fence_wait(use_cluster=use_cluster)
+
+                            addr_box = [cur_lo0, cur_lo1]
+
+                            def _mid_tdm_d2(
+                                _ls=load_stage,
+                                _ab=addr_box,
+                                _k_off=(
+                                    split_k_base
+                                    + loop_iter * arith.index(num_buffers * tile_k)
+                                    + arith.index(buf_idx * tile_k)
+                                ),
+                            ):
+                                _d0 = vector.from_elements(
+                                    T.vec(4, T.i32),
+                                    [pred_const, active0_stage_lds_addr[_ls], _ab[0],
+                                     active0_addr_hi],
+                                )
+                                tdm_ops.tensor_load_2d(
+                                    tdm_ops.TDMDescriptor2D(_d0, active0_dgroup1)
+                                )
+                                _ab[0] = arith.addi(_ab[0], active0_adv_i32)
+                                _d1 = vector.from_elements(
+                                    T.vec(4, T.i32),
+                                    [pred_const, active1_stage_lds_addr[_ls], _ab[1],
+                                     active1_addr_hi],
+                                )
+                                tdm_ops.tensor_load_2d(
+                                    tdm_ops.TDMDescriptor2D(_d1, active1_dgroup1)
+                                )
+                                _ab[1] = arith.addi(_ab[1], active1_adv_i32)
+                                _l2_prefetch(_k_off)
+
+                            _as_full_base_off[0] = (
+                                loop_iter
+                                * arith.index(num_buffers * interleaved_scale_cols_a)
+                                + arith.index(buf_idx * interleaved_scale_cols_a)
+                            )
+                            rocdl.sched_barrier(0)
+                            accs_in = compute_tile_scheduled(
+                                accs_in,
+                                stages_a_idx[buf_idx],
+                                stages_b_idx[buf_idx],
+                                as_full_idx,
+                                stages_bs_idx[buf_idx],
+                                mid_compute_callback=_mid_tdm_d2,
+                            )
+                            hot_loop_scheduler_scheduled()
+                            accs_up_in = compute_tile_scheduled(
+                                accs_up_in,
+                                stages_a_idx[buf_idx],
+                                stages_b_up_idx[buf_idx],
+                                as_full_idx,
+                                stages_bs_up_idx[buf_idx],
+                            )
+                            cur_lo0 = addr_box[0]
+                            cur_lo1 = addr_box[1]
+                            hot_loop_scheduler_scheduled()
+
+                        results = yield (
+                            list(accs_in) + list(accs_up_in) + [cur_lo0, cur_lo1]
+                        )
+
+                    accs = list(results[:n_accs])
+                    accs_up = list(results[n_accs : 2 * n_accs])
+                    active0_addr_lo = results[2 * n_accs]
+                    active1_addr_lo = results[2 * n_accs + 1]
+                elif const_expr(wst_tdm2):
                     init_args = list(accs) + [active0_addr_lo, active1_addr_lo]
 
                     for loop_iter, state in range(0, loop_iters, 1, init=init_args):
@@ -3271,7 +3485,7 @@ def compile_mxscale_gemm(
                     _tail_mid_cb = None
                     if const_expr(_load_stage is not None):
                         _tail_had_load = True
-                        if const_expr(wst_tdm2):
+                        if const_expr(wst_tdm2 or wst_dual2):
                             _tail_box2 = [active0_addr_lo, active1_addr_lo]
 
                             def _tail_mid_ws2(_ls=_load_stage, _ab=_tail_box2):
@@ -3388,7 +3602,7 @@ def compile_mxscale_gemm(
                         )
 
                     if const_expr(_load_stage is not None):
-                        if const_expr(wst_tdm2):
+                        if const_expr(wst_tdm2 or wst_dual2):
                             active0_addr_lo = _tail_box2[0]
                             active1_addr_lo = _tail_box2[1]
                         elif const_expr(wave_specialized_tdm):
