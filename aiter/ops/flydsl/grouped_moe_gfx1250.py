@@ -803,8 +803,18 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
         wave_specialized_tdm=(
-            stage1_weight_layout == "gugu"
-            and (m_warp * n_warp) == 4
+            (m_warp * n_warp) == 4
+            and (
+                stage1_weight_layout == "gugu"
+                # gguu fused gemm1 is dual-B; wave-specialized TDM is only
+                # valid there as wst_dual2, which requires As hoisted to the
+                # prologue (tdm_as_in_prologue, 2 TDM/wave across 4 waves).
+                or (
+                    stage1_weight_layout == "gguu"
+                    and os.environ.get("AITER_GROUPED_GEMM_AS_PROLOGUE", "0")
+                    in _TRUTHY_ENV
+                )
+            )
             and os.environ.get("AITER_GROUPED_GEMM1_WAVE_SPECIALIZED", "0")
             in _TRUTHY_ENV
         ),
